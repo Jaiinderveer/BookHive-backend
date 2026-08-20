@@ -1,0 +1,117 @@
+from fastapi import HTTPException
+from bson import ObjectId
+from datetime import datetime
+from database.mongodb import DBHelper
+from models.transaction import TransactionIssue, TransactionReturn
+from services.activity_service import log_activity
+
+FINE_PER_DAY = 2.0
+
+def issue_book(trans_in: TransactionIssue, db: DBHelper):
+    if not ObjectId.is_valid(trans_in.book_id) or not ObjectId.is_valid(trans_in.member_id):
+        raise HTTPException(status_code=400, detail="Invalid Book ID or Member ID")
+
+    member = db.members.find_one({"_id": ObjectId(trans_in.member_id)})
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    # The availability predicate and decrement must be one atomic operation.
+    reservation = db.books.update_one(
+        {"_id": ObjectId(trans_in.book_id), "available_quantity": {"$gt": 0}},
+        {"$inc": {"available_quantity": -1}},
+    )
+    if reservation.matched_count == 0:
+        if not db.books.find_one({"_id": ObjectId(trans_in.book_id)}):
+            raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=400, detail="Book is currently out of stock")
+
+    trans_dict = {
+        "book_id": trans_in.book_id,
+        "member_id": trans_in.member_id,
+        "issue_date": datetime.utcnow(),
+        "due_date": trans_in.due_date,
+        "return_date": None,
+        "fine": 0.0,
+        "status": "Issued"
+    }
+
+    try:
+        result = db.transactions.insert_one(trans_dict)
+    except Exception as exc:
+        # Compensate if persisting the transaction fails after stock is reserved.
+        db.books.update_one({"_id": ObjectId(trans_in.book_id)}, {"$inc": {"available_quantity": 1}})
+        raise HTTPException(status_code=500, detail="Could not create transaction") from exc
+    created_trans = db.transactions.find_one({"_id": result.inserted_id})
+    book = db.books.find_one({"_id": ObjectId(created_trans["book_id"])})
+    member = db.members.find_one({"_id": ObjectId(created_trans["member_id"])})
+    log_activity(db, "Book Issued", f"{book['title']} issued to {member['name']}")
+    return db.serialize(created_trans)
+
+def return_book(trans_in: TransactionReturn, db: DBHelper):
+    if not ObjectId.is_valid(trans_in.transaction_id):
+        raise HTTPException(status_code=400, detail="Invalid Transaction ID")
+
+    transaction = db.transactions.find_one({"_id": ObjectId(trans_in.transaction_id)})
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if transaction.get("status") != "Issued":
+        raise HTTPException(status_code=400, detail="Book already returned")
+
+    return_date = datetime.utcnow()
+    due_date = transaction["due_date"]
+    
+    fine = 0.0
+    if return_date > due_date:
+        days_late = (return_date - due_date).days
+        if days_late > 0:
+            fine = float(days_late * FINE_PER_DAY)
+
+    # Claim the return first; only one concurrent request can change Issued to Returned.
+    returned = db.transactions.update_one(
+        {"_id": ObjectId(trans_in.transaction_id), "status": "Issued"},
+        {"$set": {
+            "return_date": return_date,
+            "fine": fine,
+            "status": "Returned"
+        }}
+    )
+    if returned.modified_count == 0:
+        raise HTTPException(status_code=400, detail="Book already returned")
+
+    restored = db.books.update_one(
+        {"_id": ObjectId(transaction["book_id"])},
+        {"$inc": {"available_quantity": 1}},
+    )
+    if restored.matched_count == 0:
+        # This should only occur with legacy, orphaned data. Restore the prior state.
+        db.transactions.update_one(
+            {"_id": ObjectId(trans_in.transaction_id), "status": "Returned"},
+            {"$set": {"return_date": None, "fine": 0.0, "status": "Issued"}},
+        )
+        raise HTTPException(status_code=409, detail="The linked book no longer exists")
+    
+    updated_trans = db.transactions.find_one({"_id": ObjectId(trans_in.transaction_id)})
+    book = db.books.find_one({"_id": ObjectId(updated_trans["book_id"])})
+    member = db.members.find_one({"_id": ObjectId(updated_trans["member_id"])})
+    log_activity(db, "Book Returned", f"{book['title']} returned by {member['name']}")
+    return db.serialize(updated_trans)
+
+def get_all_transactions(db: DBHelper):
+    transactions = db.transactions.find()
+    return db.serialize_list(transactions)
+
+def get_transaction_by_id(id: str, db: DBHelper):
+    if not ObjectId.is_valid(id):
+        raise HTTPException(status_code=400, detail="Invalid Transaction ID")
+    transaction = db.transactions.find_one({"_id": ObjectId(id)})
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return db.serialize(transaction)
+
+def get_transactions_by_book(book_id: str, db: DBHelper):
+    transactions = db.transactions.find({"book_id": book_id}).sort("issue_date", -1)
+    return db.serialize_list(transactions)
+
+def get_transactions_by_member(member_id: str, db: DBHelper):
+    transactions = db.transactions.find({"member_id": member_id}).sort("issue_date", -1)
+    return db.serialize_list(transactions)
