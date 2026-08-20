@@ -21,7 +21,10 @@ Rules:
 - Never fabricate data.
 - Ask for missing information before calling tools.
 - ALWAYS ask for explicit confirmation before performing destructive actions like deleting a book or a member.
-- Keep responses concise."""
+- Keep responses concise.
+- When creating a new book, you MUST collect ALL required fields from the user: title, author, ISBN, category, quantity, publisher, publication_year. NEVER use default values like "Unknown" for author, "General" for category, or any other placeholder values.
+- If any required book field is missing, ask the user for it before calling create_book.
+- When searching for books by title, use exact case-insensitive matching."""
 
 TOOLS = [
     {
@@ -238,8 +241,6 @@ def _generation_config():
 
 def _format_result(result):
     if isinstance(result, list):
-        if not result:
-            return "No records found."
         return json.dumps(result, default=str, indent=2)
     if isinstance(result, dict):
         return json.dumps(result, default=str, indent=2)

@@ -8,12 +8,6 @@ from models.transaction import TransactionIssue, TransactionReturn
 from services import book_service, member_service, transaction_service, dashboard_service
 from services.activity_service import log_activity
 
-def _find_book_by_title(title, db):
-    books = book_service.get_books(title, None, None, None, db)
-    if not books:
-        return None
-    return books[0]
-
 def _find_member_by_name(name, db):
     members = member_service.get_all_members(db)
     for member in members:
@@ -98,15 +92,29 @@ def _delete_book(args, db):
         raise HTTPException(status_code=400, detail="Missing required field: book_id")
     return book_service.delete_book(book_id, db)
 
+def _strip_book_internal_ids(book):
+    """Remove internal database IDs from book response."""
+    if not book:
+        return book
+    stripped = book.copy()
+    # Remove internal database IDs
+    stripped.pop("id", None)
+    stripped.pop("_id", None)
+    return stripped
+
+
 def _search_book(args, db):
     title = args.get("title")
     author = args.get("author")
     isbn = args.get("isbn")
     category = args.get("category")
-    return book_service.get_books(title, author, isbn, category, db)
+    books = book_service.get_books(title, author, isbn, category, db)
+    return [_strip_book_internal_ids(book) for book in books]
+
 
 def _list_books(args, db):
-    return book_service.get_books(None, None, None, None, db)
+    books = book_service.get_books(None, None, None, None, db)
+    return [_strip_book_internal_ids(book) for book in books]
 
 def _create_member(args, db):
     required = ["name", "email", "phone", "username", "password"]
@@ -146,22 +154,39 @@ def _delete_member(args, db):
         raise HTTPException(status_code=400, detail="Missing required field: member_id")
     return member_service.delete_member(member_id, db)
 
+def _strip_member_internal_ids(member):
+    """Remove internal database IDs from member response."""
+    if not member:
+        return member
+    stripped = member.copy()
+    # Remove internal database IDs
+    stripped.pop("id", None)
+    stripped.pop("_id", None)
+    stripped.pop("user_id", None)
+    return stripped
+
+
 def _search_member(args, db):
     name = args.get("name")
     if not name:
         raise HTTPException(status_code=400, detail="Missing required field: name")
     members = member_service.get_all_members(db)
-    return [member for member in members if name.lower() in member.get("name", "").lower()]
+    return [_strip_member_internal_ids(m) for m in members if name.lower() in m.get("name", "").lower()]
 
 def _issue_book(args, db):
     book_title = args.get("book_title")
     member_name = args.get("member_name")
     due_days = int(args.get("due_days", 14))
 
+def _list_members(args, db):
+    members = member_service.get_all_members(db)
+    return [_strip_member_internal_ids(m) for m in members]
+
+
     if not book_title or not member_name:
         raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
 
-    book = _find_book_by_title(book_title, db)
+    book = book_service.find_book_by_title_exact(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
@@ -184,7 +209,7 @@ def _return_book(args, db):
     if not book_title or not member_name:
         raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
 
-    book = _find_book_by_title(book_title, db)
+    book = book_service.find_book_by_title_exact(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
@@ -202,12 +227,25 @@ def _return_book(args, db):
 def _dashboard_summary(args, db):
     return dashboard_service.get_dashboard_metrics(db)
 
+def _strip_transaction_internal_ids(transaction):
+    """Remove internal database IDs from transaction response."""
+    if not transaction:
+        return transaction
+    stripped = transaction.copy()
+    # Remove internal database IDs
+    stripped.pop("id", None)
+    stripped.pop("_id", None)
+    stripped.pop("book_id", None)
+    stripped.pop("member_id", None)
+    return stripped
+
+
 def _list_transactions(args, db):
     transactions = transaction_service.get_all_transactions(db)
     status = args.get("status")
     if status:
         transactions = [t for t in transactions if t.get("status", "").lower() == status.lower()]
-    return transactions
+    return [_strip_transaction_internal_ids(t) for t in transactions]
 
 def _adjust_book_quantity(args, db):
     book_title = args.get("book_title")
@@ -218,7 +256,7 @@ def _adjust_book_quantity(args, db):
     if quantity_delta == 0:
         raise HTTPException(status_code=400, detail="quantity_delta cannot be zero")
 
-    book = _find_book_by_title(book_title, db)
+    book = book_service.find_book_by_title_exact(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
@@ -252,7 +290,7 @@ def _extend_due_date(args, db):
     if not book_title or not member_name:
         raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
 
-    book = _find_book_by_title(book_title, db)
+    book = book_service.find_book_by_title_exact(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
