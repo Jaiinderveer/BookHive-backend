@@ -7,10 +7,40 @@ from services.activity_service import log_activity
 
 FINE_PER_DAY = 2.0
 
+
+def calculate_current_fine(transaction):
+    """
+    Calculate the current fine for a transaction.
+
+    - Returned books use their stored final fine.
+    - Currently issued books calculate the fine dynamically if overdue.
+    """
+    if transaction.get("status") == "Returned":
+        return float(transaction.get("fine", 0.0) or 0.0)
+
+    due_date = transaction.get("due_date")
+
+    if not due_date:
+        return 0.0
+
+    now = datetime.utcnow()
+
+    if now <= due_date:
+        return 0.0
+
+    # Count calendar days overdue.
+    days_late = (now.date() - due_date.date()).days
+
+    return float(max(0, days_late) * FINE_PER_DAY)
 def issue_book(trans_in: TransactionIssue, db: DBHelper):
     if not ObjectId.is_valid(trans_in.book_id) or not ObjectId.is_valid(trans_in.member_id):
         raise HTTPException(status_code=400, detail="Invalid Book ID or Member ID")
 
+    if trans_in.due_date <= datetime.utcnow():
+        raise HTTPException(
+            status_code=400,
+            detail="Due date must be in the future"
+        )
     member = db.members.find_one({"_id": ObjectId(trans_in.member_id)})
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
@@ -61,11 +91,10 @@ def return_book(trans_in: TransactionReturn, db: DBHelper):
     due_date = transaction["due_date"]
     
     fine = 0.0
-    if return_date > due_date:
-        days_late = (return_date - due_date).days
-        if days_late > 0:
-            fine = float(days_late * FINE_PER_DAY)
 
+    if return_date.date() > due_date.date():
+        days_late = (return_date.date() - due_date.date()).days
+        fine = float(days_late * FINE_PER_DAY)
     # Claim the return first; only one concurrent request can change Issued to Returned.
     returned = db.transactions.update_one(
         {"_id": ObjectId(trans_in.transaction_id), "status": "Issued"},
@@ -97,21 +126,37 @@ def return_book(trans_in: TransactionReturn, db: DBHelper):
     return db.serialize(updated_trans)
 
 def get_all_transactions(db: DBHelper):
-    transactions = db.transactions.find()
-    return db.serialize_list(transactions)
+    transactions = list(db.transactions.find())
 
+    for transaction in transactions:
+        transaction["fine"] = calculate_current_fine(transaction)
+
+    return db.serialize_list(transactions)
 def get_transaction_by_id(id: str, db: DBHelper):
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid Transaction ID")
     transaction = db.transactions.find_one({"_id": ObjectId(id)})
     if not transaction:
         raise HTTPException(status_code=404, detail="Transaction not found")
+    transaction["fine"] = calculate_current_fine(transaction)
     return db.serialize(transaction)
 
 def get_transactions_by_book(book_id: str, db: DBHelper):
-    transactions = db.transactions.find({"book_id": book_id}).sort("issue_date", -1)
+    transactions = list(
+        db.transactions.find({"book_id": book_id}).sort("issue_date", -1)
+    )
+
+    for transaction in transactions:
+        transaction["fine"] = calculate_current_fine(transaction)
+
     return db.serialize_list(transactions)
 
 def get_transactions_by_member(member_id: str, db: DBHelper):
-    transactions = db.transactions.find({"member_id": member_id}).sort("issue_date", -1)
+    transactions = list(
+        db.transactions.find({"member_id": member_id}).sort("issue_date", -1)
+    )
+
+    for transaction in transactions:
+        transaction["fine"] = calculate_current_fine(transaction)
+
     return db.serialize_list(transactions)
