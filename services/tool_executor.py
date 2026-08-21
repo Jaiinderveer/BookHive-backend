@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import re
 from bson import ObjectId
 from fastapi import HTTPException
 from database.mongodb import DBHelper
@@ -7,6 +8,19 @@ from models.member import MemberCreate, MemberUpdate
 from models.transaction import TransactionIssue, TransactionReturn
 from services import book_service, member_service, transaction_service, dashboard_service
 from services.activity_service import log_activity
+
+def _find_book_by_title(title, db):
+    """Find one book by exact title, ignoring capitalization and surrounding whitespace."""
+    if not isinstance(title, str) or not title.strip():
+        return None
+
+    normalized_title = re.sub(r"\s+", " ", title.strip())
+    pattern = f"^{re.escape(normalized_title)}$"
+
+    book = db.books.find_one({"title": {"$regex": pattern, "$options": "i"}})
+    if not book:
+        return None
+    return db.serialize(book)
 
 def _find_member_by_name(name, db):
     members = member_service.get_all_members(db)
@@ -53,11 +67,30 @@ def execute_tool(tool_name: str, arguments: dict, db: DBHelper):
 
 def _create_book(args, db):
     required = ["title", "author", "isbn", "category", "quantity"]
-    missing = [field for field in required if not args.get(field)]
+    missing = [field for field in required if args.get(field) is None or (isinstance(args.get(field), str) and not args.get(field).strip())]
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
 
-    quantity = int(args.get("quantity", 0))
+    # Prevent the model from inventing placeholder metadata. These are not valid
+    # librarian-supplied values for a new book.
+    placeholders = {"unknown", "n/a", "na", "none", "null", "general", "not provided", "not specified"}
+    invalid_placeholders = [
+        field for field in ["author", "isbn", "category"]
+        if isinstance(args.get(field), str) and args[field].strip().lower() in placeholders
+    ]
+    if invalid_placeholders:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Please provide real values for: {', '.join(invalid_placeholders)}. Do not use placeholders such as Unknown or General."
+        )
+
+    try:
+        quantity = int(args.get("quantity"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Quantity must be a valid integer")
+
+    if quantity <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
     book_in = BookCreate(
         title=args["title"],
         author=args["author"],
@@ -92,29 +125,15 @@ def _delete_book(args, db):
         raise HTTPException(status_code=400, detail="Missing required field: book_id")
     return book_service.delete_book(book_id, db)
 
-def _strip_book_internal_ids(book):
-    """Remove internal database IDs from book response."""
-    if not book:
-        return book
-    stripped = book.copy()
-    # Remove internal database IDs
-    stripped.pop("id", None)
-    stripped.pop("_id", None)
-    return stripped
-
-
 def _search_book(args, db):
     title = args.get("title")
     author = args.get("author")
     isbn = args.get("isbn")
     category = args.get("category")
-    books = book_service.get_books(title, author, isbn, category, db)
-    return [_strip_book_internal_ids(book) for book in books]
-
+    return book_service.get_books(title, author, isbn, category, db)
 
 def _list_books(args, db):
-    books = book_service.get_books(None, None, None, None, db)
-    return [_strip_book_internal_ids(book) for book in books]
+    return book_service.get_books(None, None, None, None, db)
 
 def _create_member(args, db):
     required = ["name", "email", "phone", "username", "password"]
@@ -154,39 +173,22 @@ def _delete_member(args, db):
         raise HTTPException(status_code=400, detail="Missing required field: member_id")
     return member_service.delete_member(member_id, db)
 
-def _strip_member_internal_ids(member):
-    """Remove internal database IDs from member response."""
-    if not member:
-        return member
-    stripped = member.copy()
-    # Remove internal database IDs
-    stripped.pop("id", None)
-    stripped.pop("_id", None)
-    stripped.pop("user_id", None)
-    return stripped
-
-
 def _search_member(args, db):
     name = args.get("name")
     if not name:
         raise HTTPException(status_code=400, detail="Missing required field: name")
     members = member_service.get_all_members(db)
-    return [_strip_member_internal_ids(m) for m in members if name.lower() in m.get("name", "").lower()]
+    return [member for member in members if name.lower() in member.get("name", "").lower()]
 
 def _issue_book(args, db):
     book_title = args.get("book_title")
     member_name = args.get("member_name")
     due_days = int(args.get("due_days", 14))
 
-def _list_members(args, db):
-    members = member_service.get_all_members(db)
-    return [_strip_member_internal_ids(m) for m in members]
-
-
     if not book_title or not member_name:
         raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
 
-    book = book_service.find_book_by_title_exact(book_title, db)
+    book = _find_book_by_title(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
@@ -200,7 +202,18 @@ def _list_members(args, db):
         member_id=member["id"],
         due_date=due_date,
     )
-    return transaction_service.issue_book(trans_in, db)
+    transaction = transaction_service.issue_book(trans_in, db)
+    return {
+        "bookTitle": book.get("title", "Unknown Book"),
+        "memberName": member.get("name", "Unknown Member"),
+        "status": transaction.get("status", "Issued"),
+        "issueDate": transaction.get("issue_date"),
+        "dueDate": transaction.get("due_date"),
+        "returnDate": transaction.get("return_date"),
+        "fine": transaction.get("fine", 0),
+        "overdue": False,
+        "message": f"{book.get('title', 'Book')} was issued to {member.get('name', 'member')}."
+    }
 
 def _return_book(args, db):
     book_title = args.get("book_title")
@@ -209,7 +222,7 @@ def _return_book(args, db):
     if not book_title or not member_name:
         raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
 
-    book = book_service.find_book_by_title_exact(book_title, db)
+    book = _find_book_by_title(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
@@ -222,30 +235,51 @@ def _return_book(args, db):
         raise HTTPException(status_code=404, detail=f"No issued transaction found for '{book_title}' by '{member_name}'")
 
     trans_in = TransactionReturn(transaction_id=transaction["id"])
-    return transaction_service.return_book(trans_in, db)
+    returned = transaction_service.return_book(trans_in, db)
+    return {
+        "bookTitle": book.get("title", "Unknown Book"),
+        "memberName": member.get("name", "Unknown Member"),
+        "status": returned.get("status", "Returned"),
+        "issueDate": returned.get("issue_date"),
+        "dueDate": returned.get("due_date"),
+        "returnDate": returned.get("return_date"),
+        "fine": returned.get("fine", 0),
+        "overdue": False,
+        "message": f"{book.get('title', 'Book')} was returned by {member.get('name', 'member')}."
+    }
 
 def _dashboard_summary(args, db):
     return dashboard_service.get_dashboard_metrics(db)
 
-def _strip_transaction_internal_ids(transaction):
-    """Remove internal database IDs from transaction response."""
-    if not transaction:
-        return transaction
-    stripped = transaction.copy()
-    # Remove internal database IDs
-    stripped.pop("id", None)
-    stripped.pop("_id", None)
-    stripped.pop("book_id", None)
-    stripped.pop("member_id", None)
-    return stripped
-
-
 def _list_transactions(args, db):
+    """Return librarian-friendly transaction records without internal database IDs."""
     transactions = transaction_service.get_all_transactions(db)
     status = args.get("status")
     if status:
         transactions = [t for t in transactions if t.get("status", "").lower() == status.lower()]
-    return [_strip_transaction_internal_ids(t) for t in transactions]
+
+    now = datetime.utcnow()
+    output = []
+    for transaction in transactions:
+        book = db.books.find_one({"_id": ObjectId(transaction["book_id"])}) if ObjectId.is_valid(transaction.get("book_id", "")) else None
+        member = db.members.find_one({"_id": ObjectId(transaction["member_id"])}) if ObjectId.is_valid(transaction.get("member_id", "")) else None
+        due_date = transaction.get("due_date")
+        overdue = (
+            transaction.get("status") == "Issued"
+            and due_date is not None
+            and due_date < now
+        )
+        output.append({
+            "bookTitle": book.get("title", "Unknown Book") if book else "Unknown Book",
+            "memberName": member.get("name", "Unknown Member") if member else "Unknown Member",
+            "status": transaction.get("status", "Unknown"),
+            "issueDate": transaction.get("issue_date"),
+            "dueDate": due_date,
+            "returnDate": transaction.get("return_date"),
+            "fine": transaction.get("fine", 0),
+            "overdue": overdue,
+        })
+    return output
 
 def _adjust_book_quantity(args, db):
     book_title = args.get("book_title")
@@ -256,7 +290,7 @@ def _adjust_book_quantity(args, db):
     if quantity_delta == 0:
         raise HTTPException(status_code=400, detail="quantity_delta cannot be zero")
 
-    book = book_service.find_book_by_title_exact(book_title, db)
+    book = _find_book_by_title(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
@@ -290,7 +324,7 @@ def _extend_due_date(args, db):
     if not book_title or not member_name:
         raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
 
-    book = book_service.find_book_by_title_exact(book_title, db)
+    book = _find_book_by_title(book_title, db)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 

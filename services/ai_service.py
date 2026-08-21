@@ -6,30 +6,46 @@ from config import settings
 from database.mongodb import DBHelper
 from services.tool_executor import execute_tool
 
-SYSTEM_PROMPT = """You are BookHive AI.
-You assist librarians in managing the library.
+SYSTEM_PROMPT = """You are BookHive AI, a librarian assistant for the BookHive library management system.
 
-Rules:
-- Never answer unrelated questions.
-- Never discuss politics.
-- Never discuss programming.
-- Never discuss general knowledge.
-- Only perform library operations.
-- Whenever CRUD is requested, ALWAYS use available tools.
-- Never invent books.
-- Never invent members.
-- Never fabricate data.
-- Ask for missing information before calling tools.
-- ALWAYS ask for explicit confirmation before performing destructive actions like deleting a book or a member.
-- Keep responses concise.
-- When creating a new book, you MUST collect ALL required fields from the user: title, author, ISBN, category, quantity, publisher, publication_year. NEVER use default values like "Unknown" for author, "General" for category, or any other placeholder values.
-- If any required book field is missing, ask the user for it before calling create_book.
-- When searching for books by title, use exact case-insensitive matching."""
+STRICT RULES:
+- Only perform or discuss BookHive library operations.
+- Never invent books, members, transactions, or any database data.
+- Never fabricate missing values.
+- Never expose MongoDB ObjectIds, Book IDs, Member IDs, Transaction IDs, or other internal database identifiers in your user-facing response.
+- Use tools whenever the user requests a library operation or asks for live library data.
+
+BOOK LOOKUP:
+- Book title matching is case-insensitive. Treat capitalization differences as the same title.
+- For example, "Jaiinderveer- the legend" and "jaiinderveer- the legend" refer to the same book.
+- Do not claim a book is missing merely because capitalization differs.
+- When a book title is supplied for an operation, use the appropriate book-search/quantity tool before deciding that it does not exist.
+
+BOOK CREATION:
+- NEVER create a book merely because the user confirmed they want to create it.
+- Before calling create_book, collect ALL required fields from the user: title, author, ISBN, category, and quantity.
+- Publisher and publication year should also be collected when required by the normal BookHive form/schema, but do not invent them.
+- NEVER use placeholders such as "Unknown", "General", "N/A", "None", or made-up values.
+- If any required field is missing, STOP and ask the user for the missing fields instead of calling create_book.
+- If the user only asked to add copies to an existing book, use adjust_book_quantity; do not create a new book.
+
+CONFIRMATIONS:
+- Ask for explicit confirmation before destructive actions such as deleting a book or member.
+
+EMPTY RESULTS:
+- An empty tool result is a valid result, not an error.
+- If there are no overdue books, say exactly that there are currently no overdue books.
+- Do not say "No records found" as a generic response.
+
+RESPONSE STYLE:
+- Keep responses concise and natural.
+- When structured tool results are shown by the UI, do not repeat the entire result list in text.
+- Do not mention internal tool names or implementation details."""
 
 TOOLS = [
     {
         "name": "create_book",
-        "description": "Create a new book in the library.",
+        "description": "Create a new book ONLY after the user has explicitly supplied every required field: title, author, ISBN, category, and quantity. NEVER invent or default missing fields. NEVER use placeholders such as Unknown or General.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -239,12 +255,26 @@ def _generation_config():
         temperature=0.2,
     )
 
+_INTERNAL_KEYS = {
+    "id", "_id", "book_id", "member_id", "transaction_id", "created_at"
+}
+
+def _sanitize_for_display(value):
+    """Remove internal database identifiers from frontend-facing tool results."""
+    if isinstance(value, list):
+        return [_sanitize_for_display(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_for_display(val)
+            for key, val in value.items()
+            if key not in _INTERNAL_KEYS
+        }
+    return value
+
 def _format_result(result):
-    if isinstance(result, list):
-        return json.dumps(result, default=str, indent=2)
-    if isinstance(result, dict):
-        return json.dumps(result, default=str, indent=2)
-    return str(result)
+    # Keep an empty list as valid JSON. The frontend uses [] to render the
+    # appropriate contextual empty state instead of showing a fake error.
+    return json.dumps(_sanitize_for_display(result), default=str, indent=2) if isinstance(result, (list, dict)) else str(result)
 
 def _execute_calls(function_calls, db: DBHelper):
     results = []
@@ -315,7 +345,7 @@ def process_chat(message: str, db: DBHelper, history=None):
             if text_buffer:
                 reply_text = (text_buffer + "\n\n" + reply_text).strip()
             if not reply_text:
-                reply_text = "I completed the requested operations."
+                reply_text = ""
             return {"reply": reply_text, "tool_results": all_results}
 
         if not response.candidates or not response.candidates[0].content:
@@ -345,12 +375,9 @@ def process_chat(message: str, db: DBHelper, history=None):
                 config=config,
             )
         except Exception:
-            return {"reply": "Operation completed.", "tool_results": all_results}
+            return {"reply": text_buffer.strip(), "tool_results": all_results}
 
-    reply = "I completed the requested operations. Please verify the results above."
-    if text_buffer:
-        reply = text_buffer.strip() + "\n\n" + reply
     return {
-        "reply": reply,
+        "reply": text_buffer.strip(),
         "tool_results": all_results,
     }
