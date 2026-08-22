@@ -1,10 +1,13 @@
 import json
+import logging
 from google import genai
 from google.genai import types
 from fastapi import HTTPException
 from config import settings
 from database.mongodb import DBHelper
 from services.tool_executor import execute_tool
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are BookHive AI, a librarian assistant for the BookHive library management system.
 
@@ -36,6 +39,14 @@ EMPTY RESULTS:
 - An empty tool result is a valid result, not an error.
 - If there are no overdue books, say exactly that there are currently no overdue books.
 - Do not say "No records found" as a generic response.
+
+TOOL FAILURES:
+- A tool response containing an "error" field means that operation FAILED and nothing was changed.
+- Never say or imply that an operation succeeded when its tool response contained an error.
+- State plainly which operation failed and give the reason from the error.
+- An empty list or an empty result is NOT a failure. Only an "error" field means failure.
+- When several operations were requested and only some failed, say clearly which ones succeeded and which ones failed.
+- Never invent or guess the outcome of a failed operation.
 
 RESPONSE STYLE:
 - Keep responses concise and natural.
@@ -288,11 +299,19 @@ def _execute_calls(function_calls, db: DBHelper):
             results.append({"tool": tool_name, "success": True, "result": _format_result(result)})
             response = {"result": safe_result}
         except HTTPException as exc:
+            # Expected, already user-safe failure (validation, "not found", ...).
+            # Logged for operators; the detail is safe to pass on unchanged.
+            logger.warning("AI tool %s failed: %s", tool_name, exc.detail)
             results.append({"tool": tool_name, "success": False, "error": exc.detail})
-            response = {"error": exc.detail}
+            response = {"status": "failed", "tool": tool_name, "error": exc.detail}
         except Exception:
-            results.append({"tool": tool_name, "success": False, "error": "Tool execution failed"})
-            response = {"error": "Tool execution failed"}
+            # Unexpected failure. The traceback goes to the server log only; the
+            # model and the frontend get a safe message that still identifies
+            # which operation failed.
+            logger.exception("AI tool %s raised an unexpected error", tool_name)
+            detail = f"The {tool_name.replace('_', ' ')} operation failed unexpectedly."
+            results.append({"tool": tool_name, "success": False, "error": detail})
+            response = {"status": "failed", "tool": tool_name, "error": detail}
 
         response_parts.append(
             types.Part(
@@ -300,6 +319,48 @@ def _execute_calls(function_calls, db: DBHelper):
             )
         )
     return results, response_parts
+
+
+def _failure_summary(tool_results):
+    """Factual account of failed tool calls. Never invents an outcome.
+
+    Used only when the model produced no post-tool answer of its own, so the
+    reply can never imply success for an operation that failed.
+    """
+    failures = [r for r in tool_results if not r.get("success")]
+    if not failures:
+        return ""
+
+    lines = []
+    for result in failures:
+        # Operation names are shown as plain words, never internal identifiers.
+        operation = str(result.get("tool") or "operation").replace("_", " ")
+        reason = result.get("error") or "the operation could not be completed"
+        lines.append(f"- {operation}: {reason}")
+
+    summary = "Some operations did not complete:\n" + "\n".join(lines)
+
+    succeeded = sorted({
+        str(r.get("tool")).replace("_", " ")
+        for r in tool_results
+        if r.get("success") and r.get("tool")
+    })
+    if succeeded:
+        summary += "\n\nCompleted successfully: " + ", ".join(succeeded) + "."
+
+    return summary
+
+
+def _fallback_reply(text_buffer, tool_results):
+    """Reply to use when the model never produced a post-tool answer."""
+    failure_summary = _failure_summary(tool_results)
+    if not failure_summary:
+        return (text_buffer or "").strip()
+
+    # Text emitted alongside the tool calls is usually an optimistic "I'll do
+    # that now", so it must never stand in as the final answer for an operation
+    # that failed.
+    return failure_summary
 
 
 def process_chat(message: str, db: DBHelper, history=None):
@@ -344,8 +405,10 @@ def process_chat(message: str, db: DBHelper, history=None):
             reply_text = response.text or ""
             if text_buffer:
                 reply_text = (text_buffer + "\n\n" + reply_text).strip()
-            if not reply_text:
-                reply_text = ""
+            if not reply_text.strip():
+                # The model returned nothing usable. Report what the tools
+                # actually did instead of an empty reply.
+                reply_text = _fallback_reply(text_buffer, all_results)
             return {"reply": reply_text, "tool_results": all_results}
 
         if not response.candidates or not response.candidates[0].content:
@@ -375,9 +438,28 @@ def process_chat(message: str, db: DBHelper, history=None):
                 config=config,
             )
         except Exception:
-            return {"reply": text_buffer.strip(), "tool_results": all_results}
+            # The tools already ran. Report what actually happened rather than
+            # the text the model emitted before it knew the outcome.
+            logger.exception("Gemini follow-up request failed after tool execution")
+            return {"reply": _fallback_reply(text_buffer, all_results), "tool_results": all_results}
+
+    # Tool-round budget exhausted. The last response may still carry the model's
+    # own answer, so use it instead of discarding it — but only when the model
+    # has stopped requesting tools, since pending calls were never executed.
+    trailing_text = ""
+    try:
+        if not (response.function_calls or []):
+            trailing_text = response.text or ""
+    except Exception:
+        logger.warning("Could not read trailing text from the final Gemini response", exc_info=True)
+
+    if trailing_text.strip():
+        reply = trailing_text.strip()
+        if text_buffer:
+            reply = (text_buffer + "\n\n" + reply).strip()
+        return {"reply": reply, "tool_results": all_results}
 
     return {
-        "reply": text_buffer.strip(),
+        "reply": _fallback_reply(text_buffer, all_results),
         "tool_results": all_results,
     }
