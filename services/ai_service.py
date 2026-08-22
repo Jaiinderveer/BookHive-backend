@@ -24,6 +24,16 @@ BOOK LOOKUP:
 - Do not claim a book is missing merely because capitalization differs.
 - When a book title is supplied for an operation, use the appropriate book-search/quantity tool before deciding that it does not exist.
 
+MEMBER LOOKUP:
+- Member name matching is case-insensitive. Treat capitalization differences as the same member.
+- Membership IDs are exact. Pass one whenever the librarian has given it.
+
+AMBIGUOUS MATCHES:
+- A tool may report that a title or a name matched several records. That operation did NOT happen and nothing was changed.
+- Never guess which record was meant and never retry with the same ambiguous value.
+- Show the librarian the candidates the tool listed and ask which one they mean.
+- Once they answer, retry the same tool with the exact isbn or membership_id.
+
 BOOK CREATION:
 - NEVER create a book merely because the user confirmed they want to create it.
 - Before calling create_book, collect ALL required fields from the user: title, author, ISBN, category, and quantity.
@@ -177,12 +187,14 @@ TOOLS = [
     },
     {
         "name": "issue_book",
-        "description": "Issue a book to a member.",
+        "description": "Issue a book to a member. Supply isbn and/or membership_id when a title or name matched more than one record.",
         "parameters": {
             "type": "object",
             "properties": {
                 "book_title": {"type": "string", "description": "Book title"},
                 "member_name": {"type": "string", "description": "Member name"},
+                "isbn": {"type": "string", "description": "Exact ISBN, to pick between books sharing a title"},
+                "membership_id": {"type": "string", "description": "Exact membership ID, to pick between members sharing a name"},
                 "due_days": {"type": "integer", "description": "Days until due date (default 14)"},
             },
             "required": ["book_title", "member_name"],
@@ -190,12 +202,14 @@ TOOLS = [
     },
     {
         "name": "return_book",
-        "description": "Return a book from a member.",
+        "description": "Return a book from a member. Supply isbn and/or membership_id when a title or name matched more than one record.",
         "parameters": {
             "type": "object",
             "properties": {
                 "book_title": {"type": "string", "description": "Book title"},
                 "member_name": {"type": "string", "description": "Member name"},
+                "isbn": {"type": "string", "description": "Exact ISBN, to pick between books sharing a title"},
+                "membership_id": {"type": "string", "description": "Exact membership ID, to pick between members sharing a name"},
             },
             "required": ["book_title", "member_name"],
         },
@@ -220,11 +234,12 @@ TOOLS = [
     },
     {
         "name": "adjust_book_quantity",
-        "description": "Adjust the quantity of an existing book by a delta (e.g. add 5 copies).",
+        "description": "Adjust the quantity of an existing book by a delta (e.g. add 5 copies). Supply isbn when a title matched more than one book.",
         "parameters": {
             "type": "object",
             "properties": {
                 "book_title": {"type": "string", "description": "Title of the book to adjust"},
+                "isbn": {"type": "string", "description": "Exact ISBN, to pick between books sharing a title"},
                 "quantity_delta": {"type": "integer", "description": "Change in number of copies (positive to add, negative to remove)"},
             },
             "required": ["book_title", "quantity_delta"],
@@ -232,12 +247,14 @@ TOOLS = [
     },
     {
         "name": "extend_due_date",
-        "description": "Extend the due date of an issued book for a member by a number of days.",
+        "description": "Extend the due date of an issued book for a member by a number of days. Supply isbn and/or membership_id when a title or name matched more than one record.",
         "parameters": {
             "type": "object",
             "properties": {
                 "book_title": {"type": "string", "description": "Title of the book"},
                 "member_name": {"type": "string", "description": "Name of the member"},
+                "isbn": {"type": "string", "description": "Exact ISBN, to pick between books sharing a title"},
+                "membership_id": {"type": "string", "description": "Exact membership ID, to pick between members sharing a name"},
                 "days": {"type": "integer", "description": "Number of days to extend the due date"},
             },
             "required": ["book_title", "member_name", "days"],

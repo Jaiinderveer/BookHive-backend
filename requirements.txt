@@ -9,3 +9,6 @@ pydantic-settings
 email-validator
 python-multipart
 google-genai
+# IANA timezone database for zoneinfo. Required on platforms without a system
+# tz database (notably Windows) so Asia/Kolkata resolves for fine calculations.
+tzdata

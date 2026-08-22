@@ -58,57 +58,83 @@ def update_profile(user_id: str, user_in: UserUpdate, db: DBHelper):
     if not update_data:
         raise HTTPException(status_code=400, detail="No changes provided")
 
-    # If email is being changed, make sure another user isn't already using it
-    if "email" in update_data:
-        existing_user = db.users.find_one({
-            "email": update_data["email"],
-            "_id": {"$ne": user_object_id}
-        })
+    member = db.members.find_one({"user_id": user_id})
 
-        if existing_user:
+    # name, phone and address live only on the member profile. An account without
+    # one (a librarian) has nowhere to store them, so refuse rather than return a
+    # success response for fields that were silently dropped.
+    member_only_fields = [f for f in ("name", "phone", "address") if f in update_data]
+    if member_only_fields and not member:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This account has no member profile, so "
+                f"{', '.join(member_only_fields)} cannot be saved. "
+                "Only the email address can be updated."
+            ),
+        )
+
+    # Email is the login identifier and is unique in both collections. Check both
+    # before writing either, so a rejected second write cannot leave the two
+    # records disagreeing about the address.
+    if "email" in update_data:
+        new_email = update_data["email"]
+        if db.users.find_one({"email": new_email, "_id": {"$ne": user_object_id}}):
+            raise HTTPException(
+                status_code=400,
+                detail="Email already registered"
+            )
+        member_conflict = {"email": new_email}
+        if member:
+            member_conflict["_id"] = {"$ne": member["_id"]}
+        if db.members.find_one(member_conflict):
             raise HTTPException(
                 status_code=400,
                 detail="Email already registered"
             )
 
+    # Fields stored in members. Email is mirrored here so both records agree.
+    member_update = {
+        field: update_data[field]
+        for field in ("name", "email", "phone", "address")
+        if field in update_data
+    }
+
+    if member_update and member:
+        try:
+            db.members.update_one({"_id": member["_id"]}, {"$set": member_update})
+        except DuplicateKeyError as exc:
+            raise HTTPException(status_code=400, detail="Email already registered") from exc
+
     # Fields stored in users
-    user_update = {}
-
     if "email" in update_data:
-        user_update["email"] = update_data["email"]
-
-    if user_update:
-        db.users.update_one(
-            {"_id": user_object_id},
-            {"$set": user_update}
-        )
-
-    # Fields stored in members
-    member_update = {}
-
-    for field in ["name", "email", "phone", "address"]:
-        if field in update_data:
-            member_update[field] = update_data[field]
-
-    if member_update:
-        db.members.update_one(
-            {"user_id": user_id},
-            {"$set": member_update}
-        )
+        try:
+            db.users.update_one(
+                {"_id": user_object_id},
+                {"$set": {"email": update_data["email"]}}
+            )
+        except DuplicateKeyError as exc:
+            # Put the member record back so the collections cannot disagree.
+            if member and "email" in member_update:
+                db.members.update_one(
+                    {"_id": member["_id"]},
+                    {"$set": {"email": member.get("email")}},
+                )
+            raise HTTPException(status_code=400, detail="Email already registered") from exc
 
     # Fetch updated data
     updated_user = db.users.find_one({"_id": user_object_id})
-    member = db.members.find_one({"user_id": user_id})
+    updated_member = db.members.find_one({"user_id": user_id}) if member else None
 
     # Librarian accounts have no members document. Mirror the guarded shape used
     # by GET /auth/me so a missing profile cannot raise AttributeError here.
     return {
         "id": str(updated_user["_id"]),
         "username": updated_user["username"],
-        "name": member.get("name", "") if member else "",
+        "name": updated_member.get("name", "") if updated_member else "",
         "email": updated_user["email"],
-        "phone": member.get("phone", "") if member else "",
-        "address": member.get("address") if member else None,
+        "phone": updated_member.get("phone", "") if updated_member else "",
+        "address": updated_member.get("address") if updated_member else None,
         "role": updated_user.get("role", "member")
     }
 def register_user(user_in: UserCreate, db: DBHelper):

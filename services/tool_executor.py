@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 import re
 from bson import ObjectId
 from fastapi import HTTPException
@@ -8,26 +8,173 @@ from models.member import MemberCreate, MemberUpdate
 from models.transaction import TransactionIssue, TransactionReturn
 from services import book_service, member_service, transaction_service, dashboard_service
 from services.activity_service import log_activity
+from utils.dates import as_utc, days_overdue, utc_now
 
-def _find_book_by_title(title, db):
-    """Find one book by exact title, ignoring capitalization and surrounding whitespace."""
-    if not isinstance(title, str) or not title.strip():
-        return None
+# Cap on how many candidates an ambiguity message spells out.
+_MAX_LISTED_CANDIDATES = 5
 
-    normalized_title = re.sub(r"\s+", " ", title.strip())
-    pattern = f"^{re.escape(normalized_title)}$"
 
-    book = db.books.find_one({"title": {"$regex": pattern, "$options": "i"}})
-    if not book:
-        return None
-    return db.serialize(book)
+def _normalized(value):
+    """Trimmed text with internal runs of whitespace collapsed to one space."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value.strip())
 
-def _find_member_by_name(name, db):
-    members = member_service.get_all_members(db)
+
+def _describe_candidates(descriptions):
+    """Join candidate descriptions, spelling out only the first few."""
+    listed = descriptions[:_MAX_LISTED_CANDIDATES]
+    remaining = len(descriptions) - len(listed)
+    if remaining > 0:
+        listed = listed + [f"and {remaining} more"]
+    return "; ".join(listed)
+
+
+def _describe_members(members):
+    """Librarian-facing details for members that a name could refer to.
+
+    Membership ID and email are the identifiers a librarian works with. Internal
+    MongoDB IDs are never included.
+    """
+    descriptions = []
     for member in members:
-        if name.lower() in member.get("name", "").lower():
-            return member
+        detail = member.get("name") or "Unnamed member"
+        identifiers = [
+            part
+            for part in (
+                f"membership ID {member.get('membership_id')}" if member.get("membership_id") else "",
+                member.get("email") or "",
+            )
+            if part
+        ]
+        if identifiers:
+            detail += f" ({', '.join(identifiers)})"
+        descriptions.append(detail)
+    return _describe_candidates(descriptions)
+
+
+def _describe_books(books):
+    """Librarian-facing details for books that share a title. No internal IDs."""
+    descriptions = []
+    for book in books:
+        detail = book.get("title") or "Untitled"
+        if book.get("author"):
+            detail += f" by {book['author']}"
+        if book.get("isbn"):
+            detail += f" (ISBN {book['isbn']})"
+        descriptions.append(detail)
+    return _describe_candidates(descriptions)
+
+
+def _find_book_by_title(title, db, isbn=None):
+    """Resolve exactly one book, or refuse rather than guessing.
+
+    An ISBN, being unique, decides outright when the librarian supplies one.
+    Otherwise the title must match exactly, ignoring capitalization and stray
+    whitespace. When several books share that title the caller gets a 409
+    listing the candidates instead of an arbitrary pick.
+    """
+    normalized_isbn = _normalized(isbn)
+    if normalized_isbn:
+        book = db.books.find_one({"isbn": normalized_isbn})
+        if not book:
+            raise HTTPException(
+                status_code=404, detail=f"No book found with ISBN '{normalized_isbn}'"
+            )
+        return db.serialize(book)
+
+    normalized_title = _normalized(title)
+    if not normalized_title:
+        return None
+
+    pattern = f"^{re.escape(normalized_title)}$"
+    matches = list(db.books.find({"title": {"$regex": pattern, "$options": "i"}}))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(matches)} books share the title '{normalized_title}': "
+                f"{_describe_books(matches)}. "
+                "Ask the librarian which ISBN to use, then retry with that isbn."
+            ),
+        )
+    return db.serialize(matches[0])
+
+
+def _find_member_by_name(name, db, membership_id=None):
+    """Resolve exactly one member, or refuse rather than guessing.
+
+    Resolution order:
+      1. Membership ID, being unique, when the librarian supplies one.
+      2. Exact name match, ignoring capitalization and stray whitespace.
+      3. Partial name match, but only when it identifies a single member.
+
+    Several matches never collapse to an arbitrary pick: the caller gets a 409
+    listing the candidates so the librarian can choose. Returns None when
+    nothing matches, leaving the caller's own "not found" message intact.
+    """
+    members = member_service.get_all_members(db)
+
+    normalized_membership_id = _normalized(membership_id)
+    if normalized_membership_id:
+        target_id = normalized_membership_id.lower()
+        for member in members:
+            if _normalized(member.get("membership_id")).lower() == target_id:
+                return member
+        raise HTTPException(
+            status_code=404,
+            detail=f"No member found with membership ID '{normalized_membership_id}'",
+        )
+
+    normalized_name = _normalized(name)
+    if not normalized_name:
+        return None
+    target_name = normalized_name.lower()
+
+    exact = [m for m in members if _normalized(m.get("name")).lower() == target_name]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(exact)} members are named '{normalized_name}': "
+                f"{_describe_members(exact)}. "
+                "Ask the librarian which one, then retry with that membership_id."
+            ),
+        )
+
+    partial = [m for m in members if target_name in _normalized(m.get("name")).lower()]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{normalized_name}' matches {len(partial)} members: "
+                f"{_describe_members(partial)}. "
+                "Ask the librarian for the full name or membership ID, then retry."
+            ),
+        )
+
     return None
+
+
+def _positive_int(args, key, default):
+    """Read a whole-number argument the model supplied, or reject it clearly."""
+    raw = args.get(key, default)
+    if raw is None:
+        raw = default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{key} must be a whole number")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{key} must be greater than 0")
+    return value
+
 
 def _find_issued_transaction(book_id, member_id, db):
     transactions = transaction_service.get_all_transactions(db)
@@ -174,29 +321,38 @@ def _delete_member(args, db):
     return member_service.delete_member(member_id, db)
 
 def _search_member(args, db):
-    name = args.get("name")
-    if not name:
+    normalized_name = _normalized(args.get("name"))
+    if not normalized_name:
         raise HTTPException(status_code=400, detail="Missing required field: name")
+    # A search legitimately returns every match, so the caller can see the
+    # candidates. Matching ignores capitalization and stray whitespace.
+    target = normalized_name.lower()
     members = member_service.get_all_members(db)
-    return [member for member in members if name.lower() in member.get("name", "").lower()]
+    return [member for member in members if target in _normalized(member.get("name")).lower()]
 
 def _issue_book(args, db):
     book_title = args.get("book_title")
     member_name = args.get("member_name")
-    due_days = int(args.get("due_days", 14))
+    isbn = args.get("isbn")
+    membership_id = args.get("membership_id")
 
-    if not book_title or not member_name:
-        raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
+    if not (_normalized(book_title) or _normalized(isbn)):
+        raise HTTPException(status_code=400, detail="Missing required field: book_title")
+    if not (_normalized(member_name) or _normalized(membership_id)):
+        raise HTTPException(status_code=400, detail="Missing required field: member_name")
 
-    book = _find_book_by_title(book_title, db)
+    # Parsed before anything is resolved so a bad value cannot reach the mutation.
+    due_days = _positive_int(args, "due_days", 14)
+
+    book = _find_book_by_title(book_title, db, isbn=isbn)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
-    member = _find_member_by_name(member_name, db)
+    member = _find_member_by_name(member_name, db, membership_id=membership_id)
     if not member:
         raise HTTPException(status_code=404, detail=f"Member '{member_name}' not found")
 
-    due_date = datetime.utcnow() + timedelta(days=due_days)
+    due_date = utc_now() + timedelta(days=due_days)
     trans_in = TransactionIssue(
         book_id=book["id"],
         member_id=member["id"],
@@ -218,15 +374,19 @@ def _issue_book(args, db):
 def _return_book(args, db):
     book_title = args.get("book_title")
     member_name = args.get("member_name")
+    isbn = args.get("isbn")
+    membership_id = args.get("membership_id")
 
-    if not book_title or not member_name:
-        raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
+    if not (_normalized(book_title) or _normalized(isbn)):
+        raise HTTPException(status_code=400, detail="Missing required field: book_title")
+    if not (_normalized(member_name) or _normalized(membership_id)):
+        raise HTTPException(status_code=400, detail="Missing required field: member_name")
 
-    book = _find_book_by_title(book_title, db)
+    book = _find_book_by_title(book_title, db, isbn=isbn)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
-    member = _find_member_by_name(member_name, db)
+    member = _find_member_by_name(member_name, db, membership_id=membership_id)
     if not member:
         raise HTTPException(status_code=404, detail=f"Member '{member_name}' not found")
 
@@ -258,16 +418,16 @@ def _list_transactions(args, db):
     if status:
         transactions = [t for t in transactions if t.get("status", "").lower() == status.lower()]
 
-    now = datetime.utcnow()
     output = []
     for transaction in transactions:
         book = db.books.find_one({"_id": ObjectId(transaction["book_id"])}) if ObjectId.is_valid(transaction.get("book_id", "")) else None
         member = db.members.find_one({"_id": ObjectId(transaction["member_id"])}) if ObjectId.is_valid(transaction.get("member_id", "")) else None
         due_date = transaction.get("due_date")
+        # Same Asia/Kolkata calendar rule as the fine calculation, so the flag
+        # here can never disagree with the fine shown beside it.
         overdue = (
             transaction.get("status") == "Issued"
-            and due_date is not None
-            and due_date < now
+            and days_overdue(due_date) > 0
         )
         output.append({
             "bookTitle": book.get("title", "Unknown Book") if book else "Unknown Book",
@@ -283,18 +443,31 @@ def _list_transactions(args, db):
 
 def _adjust_book_quantity(args, db):
     book_title = args.get("book_title")
-    quantity_delta = int(args.get("quantity_delta", 0))
+    isbn = args.get("isbn")
 
-    if not book_title:
+    if not (_normalized(book_title) or _normalized(isbn)):
         raise HTTPException(status_code=400, detail="Missing required field: book_title")
+
+    # Validated before the book is resolved so a bad delta cannot reach the write.
+    try:
+        quantity_delta = int(args.get("quantity_delta", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="quantity_delta must be a whole number")
     if quantity_delta == 0:
         raise HTTPException(status_code=400, detail="quantity_delta cannot be zero")
 
-    book = _find_book_by_title(book_title, db)
+    book = _find_book_by_title(book_title, db, isbn=isbn)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
-    new_quantity = book["quantity"] + quantity_delta
+    current_quantity = book.get("quantity")
+    if not isinstance(current_quantity, int):
+        raise HTTPException(
+            status_code=409,
+            detail=f"'{book.get('title', 'This book')}' has no valid quantity recorded",
+        )
+
+    new_quantity = current_quantity + quantity_delta
     if new_quantity < 0:
         new_quantity = 0
 
@@ -319,16 +492,22 @@ def _adjust_book_quantity(args, db):
 def _extend_due_date(args, db):
     book_title = args.get("book_title")
     member_name = args.get("member_name")
-    days = int(args.get("days", 7))
+    isbn = args.get("isbn")
+    membership_id = args.get("membership_id")
 
-    if not book_title or not member_name:
-        raise HTTPException(status_code=400, detail="Missing required fields: book_title, member_name")
+    if not (_normalized(book_title) or _normalized(isbn)):
+        raise HTTPException(status_code=400, detail="Missing required field: book_title")
+    if not (_normalized(member_name) or _normalized(membership_id)):
+        raise HTTPException(status_code=400, detail="Missing required field: member_name")
 
-    book = _find_book_by_title(book_title, db)
+    # Validated before anything is resolved so a bad value cannot reach the write.
+    days = _positive_int(args, "days", 7)
+
+    book = _find_book_by_title(book_title, db, isbn=isbn)
     if not book:
         raise HTTPException(status_code=404, detail=f"Book '{book_title}' not found")
 
-    member = _find_member_by_name(member_name, db)
+    member = _find_member_by_name(member_name, db, membership_id=membership_id)
     if not member:
         raise HTTPException(status_code=404, detail=f"Member '{member_name}' not found")
 
@@ -336,11 +515,22 @@ def _extend_due_date(args, db):
     if not transaction:
         raise HTTPException(status_code=404, detail=f"No issued transaction found for '{book_title}' by '{member_name}'")
 
-    new_due_date = transaction["due_date"] + timedelta(days=days)
+    current_due_date = as_utc(transaction.get("due_date"))
+    if current_due_date is None:
+        raise HTTPException(
+            status_code=409, detail="This transaction has no valid due date to extend"
+        )
+
+    new_due_date = current_due_date + timedelta(days=days)
     db.transactions.update_one(
         {"_id": ObjectId(transaction["id"])},
         {"$set": {"due_date": new_due_date}},
     )
     updated_trans = db.transactions.find_one({"_id": ObjectId(transaction["id"])})
-    log_activity(db, "Due Date Extended", f"Due date for '{book['title']}' extended by {days} days for {member['name']}")
+    log_activity(
+        db,
+        "Due Date Extended",
+        f"Due date for '{book.get('title', 'a book')}' extended by {days} days "
+        f"for {member.get('name', 'a member')}",
+    )
     return db.serialize(updated_trans)

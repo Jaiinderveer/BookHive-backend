@@ -75,8 +75,21 @@ def create_member_account(id: str, account_in: MemberAccountCreate, db: DBHelper
 def update_member(id: str, member_in: MemberUpdate, db: DBHelper):
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid Member ID")
-        
-    update_data = {k: v for k, v in member_in.model_dump().items() if v is not None}
+
+    supplied = member_in.model_dump(exclude_unset=True)
+
+    # name, email and phone are required on a member, so a null there means
+    # "leave this field as it is". address is optional, so an explicitly supplied
+    # null or blank value clears it rather than being dropped.
+    update_data = {
+        key: value
+        for key, value in supplied.items()
+        if key != "address" and value is not None
+    }
+    if "address" in supplied:
+        address = supplied["address"]
+        update_data["address"] = address.strip() or None if isinstance(address, str) else None
+
     if not update_data:
         raise HTTPException(status_code=400, detail="No data provided to update")
 
@@ -97,7 +110,7 @@ def update_member(id: str, member_in: MemberUpdate, db: DBHelper):
         db.users.update_one({"_id": ObjectId(member["user_id"])}, {"$set": {"email": update_data["email"]}})
         
     updated_member = db.members.find_one({"_id": ObjectId(id)})
-    log_activity(db, "Member Updated", f"{updated_member['name']} details updated")
+    log_activity(db, "Member Updated", f"{updated_member.get('name', 'Member')} details updated")
     return db.serialize(updated_member)
 
 def delete_member(id: str, db: DBHelper):

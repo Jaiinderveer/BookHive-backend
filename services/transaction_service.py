@@ -1,49 +1,38 @@
 from fastapi import HTTPException
 from bson import ObjectId
-from datetime import datetime, timezone
 from database.mongodb import DBHelper
 from models.transaction import TransactionIssue, TransactionReturn
 from services.activity_service import log_activity
+from utils.dates import as_utc, days_overdue, utc_now
 
 FINE_PER_DAY = 2.0
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def as_utc(value):
-    """Normalize a datetime from MongoDB or the API to timezone-aware UTC."""
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 def calculate_current_fine(transaction):
     """
     Calculate the current fine for a transaction.
 
-    - Returned books use their stored final fine.
-    - Currently issued books calculate the fine dynamically if overdue.
+    - Returned books keep their stored final fine.
+    - Issued books accrue FINE_PER_DAY for every whole Asia/Kolkata calendar day
+      past the due date, so a book due today carries no fine.
     - Legacy timezone-less MongoDB dates are treated as UTC.
     """
     if transaction.get("status") == "Returned":
-        return float(transaction.get("fine", 0.0) or 0.0)
+        try:
+            return float(transaction.get("fine", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            # A legacy record with a non-numeric fine must not break the listing.
+            return 0.0
 
-    due_date = as_utc(transaction.get("due_date"))
-    if not due_date:
-        return 0.0
+    return float(days_overdue(transaction.get("due_date")) * FINE_PER_DAY)
 
-    now = utc_now()
 
-    if now <= due_date:
-        return 0.0
-
-    # Count calendar days overdue.
-    days_late = (now.date() - due_date.date()).days
-    return float(max(0, days_late) * FINE_PER_DAY)
+def _find_related_member(transaction, db: DBHelper):
+    """Member linked to a transaction, or None for legacy or orphaned links."""
+    member_id = (transaction or {}).get("member_id")
+    if not ObjectId.is_valid(member_id):
+        return None
+    return db.members.find_one({"_id": ObjectId(member_id)})
 
 
 def issue_book(trans_in: TransactionIssue, db: DBHelper):
@@ -95,9 +84,16 @@ def issue_book(trans_in: TransactionIssue, db: DBHelper):
         raise HTTPException(status_code=500, detail="Could not create transaction") from exc
 
     created_trans = db.transactions.find_one({"_id": result.inserted_id})
+    # The issue already succeeded, so a concurrently deleted related record must
+    # not turn into a 500 that makes a completed issue look like a failure.
     book = db.books.find_one({"_id": ObjectId(created_trans["book_id"])})
-    member = db.members.find_one({"_id": ObjectId(created_trans["member_id"])})
-    log_activity(db, "Book Issued", f"{book['title']} issued to {member['name']}")
+    member = _find_related_member(created_trans, db)
+    log_activity(
+        db,
+        "Book Issued",
+        f"{(book or {}).get('title', 'Unknown book')} issued to "
+        f"{(member or {}).get('name', 'unknown member')}",
+    )
     return db.serialize(created_trans)
 
 
@@ -116,10 +112,15 @@ def return_book(trans_in: TransactionReturn, db: DBHelper):
     if due_date is None:
         raise HTTPException(status_code=500, detail="Transaction has no due date")
 
-    fine = 0.0
-    if return_date.date() > due_date.date():
-        days_late = (return_date.date() - due_date.date()).days
-        fine = float(days_late * FINE_PER_DAY)
+    book_id = transaction.get("book_id")
+    if not ObjectId.is_valid(book_id):
+        # Legacy or corrupted link. Refuse before touching any state so the
+        # transaction and the stock count cannot drift apart.
+        raise HTTPException(status_code=409, detail="The linked book record is invalid")
+
+    # Fines accrue per whole Asia/Kolkata calendar day past the due date, so a
+    # book returned on its due date carries no fine.
+    fine = float(days_overdue(due_date, return_date) * FINE_PER_DAY)
 
     # Claim the return first; only one concurrent request can change Issued to Returned.
     returned = db.transactions.update_one(
@@ -134,7 +135,7 @@ def return_book(trans_in: TransactionReturn, db: DBHelper):
         raise HTTPException(status_code=400, detail="Book already returned")
 
     restored = db.books.update_one(
-        {"_id": ObjectId(transaction["book_id"])},
+        {"_id": ObjectId(book_id)},
         {"$inc": {"available_quantity": 1}},
     )
     if restored.matched_count == 0:
@@ -146,9 +147,16 @@ def return_book(trans_in: TransactionReturn, db: DBHelper):
         raise HTTPException(status_code=409, detail="The linked book no longer exists")
 
     updated_trans = db.transactions.find_one({"_id": ObjectId(trans_in.transaction_id)})
-    book = db.books.find_one({"_id": ObjectId(updated_trans["book_id"])})
-    member = db.members.find_one({"_id": ObjectId(updated_trans["member_id"])})
-    log_activity(db, "Book Returned", f"{book['title']} returned by {member['name']}")
+    # The return already succeeded, so a missing related record must not turn
+    # into a 500 that makes a completed return look like a failure.
+    book = db.books.find_one({"_id": ObjectId(book_id)})
+    member = _find_related_member(updated_trans, db)
+    log_activity(
+        db,
+        "Book Returned",
+        f"{(book or {}).get('title', 'Unknown book')} returned by "
+        f"{(member or {}).get('name', 'unknown member')}",
+    )
     return db.serialize(updated_trans)
 
 

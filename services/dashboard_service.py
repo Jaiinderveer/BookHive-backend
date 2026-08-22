@@ -1,7 +1,7 @@
-from datetime import datetime
 from bson import ObjectId
 from database.mongodb import DBHelper
 from services.activity_service import get_recent_activities
+from utils.dates import start_of_today_utc
 
 def get_dashboard_metrics(db: DBHelper):
     total_members = db.members.count_documents({})
@@ -23,13 +23,19 @@ def get_dashboard_metrics(db: DBHelper):
 
     books_issued = db.transactions.count_documents({"status": "Issued"})
 
-    now = datetime.utcnow()
+    # Local midnight in the library timezone, expressed as the UTC instant that
+    # MongoDB stores. Both metrics below are calendar rules, not elapsed-time
+    # rules, so they must pivot on the local day boundary rather than on UTC.
+    start_of_today = start_of_today_utc()
+
+    # A book is overdue only once the local calendar date is past its due date,
+    # which is exactly a due date falling before local midnight today. This
+    # matches the fine calculation, so anything due today is not counted.
     overdue_books = db.transactions.count_documents({
         "status": "Issued",
-        "due_date": {"$lt": now}
+        "due_date": {"$lt": start_of_today}
     })
 
-    start_of_today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     today_transactions = db.transactions.count_documents({
         "$or": [
             {"issue_date": {"$gte": start_of_today}},
@@ -46,7 +52,12 @@ def get_dashboard_metrics(db: DBHelper):
     # Low stock
     low_stock_books = list(db.books.find({"available_quantity": {"$lt": 5, "$gt": 0}}).limit(3))
     for book in low_stock_books:
-        insights.append(f"Only {book['available_quantity']} copies of {book['title']} remain.")
+        # Legacy or imported books may be missing a title or a numeric count.
+        # Skip those rather than failing the whole dashboard.
+        title = book.get("title")
+        available = book.get("available_quantity")
+        if title and isinstance(available, int):
+            insights.append(f"Only {available} copies of {title} remain.")
 
     # Overdue
     if overdue_books > 0:
@@ -70,7 +81,7 @@ def get_dashboard_metrics(db: DBHelper):
         else:
             continue
         member = db.members.find_one({"_id": member_key})
-        if member:
+        if member and member.get("name"):
             insights.append(f"{member['name']} has unpaid fines.")
 
     return {

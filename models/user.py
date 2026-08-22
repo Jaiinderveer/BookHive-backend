@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional
 
 class UserCreate(BaseModel):
@@ -20,6 +20,26 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
     phone: Optional[str] = Field(default=None, min_length=1, max_length=30)
     address: Optional[str] = None
+
+    @field_validator("name", "phone")
+    @classmethod
+    def reject_blank_required_field(cls, value):
+        """A profile must keep a name and a phone, so neither can be blanked."""
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("This field is required and cannot be empty")
+        return trimmed
+
+    @field_validator("address")
+    @classmethod
+    def normalize_optional_field(cls, value):
+        """Address is optional, so a blank value clears it instead of storing spaces."""
+        if value is None:
+            return None
+        return value.strip() or None
+
 class Token(BaseModel):
     access_token: str
     token_type: str
