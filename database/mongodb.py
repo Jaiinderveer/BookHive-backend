@@ -5,10 +5,7 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
-# pymongo waits 30 seconds by default before reporting that it cannot reach a
-# server. That is long enough for a platform health check to time out first, so
-# a connection problem gets reported as something else entirely. These explicit
-# timeouts make the real failure surface quickly.
+# Keep MongoDB failures from blocking startup for the platform's entire health-check window.
 SERVER_SELECTION_TIMEOUT_MS = 5_000
 CONNECT_TIMEOUT_MS = 5_000
 SOCKET_TIMEOUT_MS = 20_000
@@ -16,10 +13,8 @@ SOCKET_TIMEOUT_MS = 20_000
 
 class DBHelper:
     def __init__(self):
-        # connect=False keeps the constructor from starting any connection work,
-        # so importing this module never touches the network. Everything that
-        # needs a live server happens in initialize(), called from the FastAPI
-        # lifespan handler.
+        # Construction must not perform network I/O. Database initialization is handled
+        # explicitly from the FastAPI lifespan handler.
         self.client = MongoClient(
             settings.MONGODB_URL,
             serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
@@ -29,7 +24,6 @@ class DBHelper:
         )
         self.db = self.client["bookhive"]
 
-        # Collections
         self.users = self.db["users"]
         self.books = self.db["books"]
         self.members = self.db["members"]
@@ -37,13 +31,7 @@ class DBHelper:
         self.activities = self.db["activities"]
 
     def initialize(self):
-        """Prepare the database for use. Runs once at application startup.
-
-        Called from the FastAPI lifespan handler rather than at import time: if
-        MongoDB is unreachable the process must still start, otherwise no CORS
-        headers are ever sent and the browser reports a backend outage as a CORS
-        failure.
-        """
+        """Prepare the database for use during application startup."""
         self.client.admin.command("ping")
         logger.info("Connected to MongoDB.")
         self._ensure_indexes()
@@ -53,7 +41,7 @@ class DBHelper:
         logger.info("Database initialisation complete.")
 
     def _ensure_indexes(self):
-        """Enforce identifiers that must remain unique even under concurrent requests."""
+        """Enforce identifiers that must remain unique under concurrent requests."""
         self.users.create_index("username", unique=True)
         self.users.create_index("email", unique=True)
         self.books.create_index("isbn", unique=True)
@@ -65,14 +53,13 @@ class DBHelper:
         self.activities.create_index("timestamp")
 
     def _link_existing_member_accounts(self):
-        """Safely link legacy member profiles to matching member login accounts.
-
-        Driven by the profiles that still need linking rather than by the whole
-        user collection, so a database where nothing is outstanding costs two
-        reads and no writes. Returns the number of profiles linked.
-        """
-        unlinked_filter = {"$or": [{"user_id": {"$exists": False}}, {"user_id": None}]}
-        unlinked = list(self.members.find(unlinked_filter, {"_id": 1, "email": 1}))
+        """Link legacy member profiles to matching member login accounts once."""
+        unlinked_filter = {
+            "$or": [{"user_id": {"$exists": False}}, {"user_id": None}]
+        }
+        unlinked = list(
+            self.members.find(unlinked_filter, {"_id": 1, "email": 1})
+        )
         emails = {member["email"] for member in unlinked if member.get("email")}
         if not emails:
             return 0
@@ -89,8 +76,6 @@ class DBHelper:
 
         operations = [
             UpdateOne(
-                # The unlinked condition is repeated here so a profile claimed by
-                # a concurrent request is left alone.
                 {"_id": member["_id"], **unlinked_filter},
                 {"$set": {"user_id": user_id_by_email[member["email"]]}},
             )
@@ -114,7 +99,9 @@ class DBHelper:
     def serialize_list(self, docs):
         return [self.serialize(doc) for doc in docs]
 
+
 db_helper = DBHelper()
+
 
 def get_db():
     return db_helper
