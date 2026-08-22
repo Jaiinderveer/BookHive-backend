@@ -60,7 +60,16 @@ def get_dashboard_metrics(db: DBHelper):
     # Unpaid fines
     members_with_fines = list(db.transactions.find({"status": "Returned", "fine": {"$gt": 0}}).limit(3))
     for trans in members_with_fines:
-        member = db.members.find_one({"_id": trans["member_id"] if isinstance(trans["member_id"], ObjectId) else ObjectId(trans["member_id"])})
+        # Legacy or imported transactions may carry a missing or non-ObjectId
+        # member_id. Skip those rather than failing the whole dashboard.
+        raw_member_id = trans.get("member_id")
+        if isinstance(raw_member_id, ObjectId):
+            member_key = raw_member_id
+        elif ObjectId.is_valid(raw_member_id):
+            member_key = ObjectId(raw_member_id)
+        else:
+            continue
+        member = db.members.find_one({"_id": member_key})
         if member:
             insights.append(f"{member['name']} has unpaid fines.")
 

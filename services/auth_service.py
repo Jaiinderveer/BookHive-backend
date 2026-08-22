@@ -100,13 +100,15 @@ def update_profile(user_id: str, user_in: UserUpdate, db: DBHelper):
     updated_user = db.users.find_one({"_id": user_object_id})
     member = db.members.find_one({"user_id": user_id})
 
+    # Librarian accounts have no members document. Mirror the guarded shape used
+    # by GET /auth/me so a missing profile cannot raise AttributeError here.
     return {
         "id": str(updated_user["_id"]),
         "username": updated_user["username"],
-        "name": member.get("name", ""),
+        "name": member.get("name", "") if member else "",
         "email": updated_user["email"],
-        "phone": member.get("phone", ""),
-        "address": member.get("address"),
+        "phone": member.get("phone", "") if member else "",
+        "address": member.get("address") if member else None,
         "role": updated_user.get("role", "member")
     }
 def register_user(user_in: UserCreate, db: DBHelper):

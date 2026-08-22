@@ -256,7 +256,7 @@ def _generation_config():
     )
 
 _INTERNAL_KEYS = {
-    "id", "_id", "book_id", "member_id", "transaction_id", "created_at"
+    "id", "_id", "book_id", "member_id", "transaction_id", "user_id", "created_at"
 }
 
 def _sanitize_for_display(value):

@@ -338,9 +338,9 @@ def _extend_due_date(args, db):
 
     new_due_date = transaction["due_date"] + timedelta(days=days)
     db.transactions.update_one(
-        {"_id": ObjectId(transaction["_id"])},
+        {"_id": ObjectId(transaction["id"])},
         {"$set": {"due_date": new_due_date}},
     )
-    updated_trans = db.transactions.find_one({"_id": ObjectId(transaction["_id"])})
+    updated_trans = db.transactions.find_one({"_id": ObjectId(transaction["id"])})
     log_activity(db, "Due Date Extended", f"Due date for '{book['title']}' extended by {days} days for {member['name']}")
     return db.serialize(updated_trans)
